@@ -12,7 +12,8 @@ extends qw(Text::Xslate::Parser);
 
 sub _build_identity_pattern {
     # XXX: "#" is hard-coded in the tokanizer
-    return qr/(?: [A-Za-z_] [A-Za-z0-9_]* | \# )/xms;
+    # NOTE: "-" is a valid character
+    return qr/(?: [A-Za-z_] [A-Za-z0-9_-]* | \# )/xms;
 }
 
 # {{ mustache }}
@@ -30,21 +31,37 @@ around trim_code => sub {
     return $super->($self, $code);
 };
 
-#around split => sub {
-#    my($super, $self, $input) = @_;
-#
-#    my $tokens_ref = $super->($self, $input);
-#    for(my $i = 0; $i < @{$tokens_ref}; $i++) {
-#        my $token = $tokens_ref->[$i];
-#        # XXX: really bad know-how :(
-#        if($token->[0] eq 'code'
-#            && ( $token->[1] =~ m{\A \#}xms || $token->[1] =~ m{/ \z}xms )) {
-#            splice @{$tokens_ref}, $i, 1, ['prechomp'], $token, ['postchomp'];
-#            $i += 2;
-#        }
-#    }
-#    return $tokens_ref;
-#};
+around split => sub {
+    my($super, $self, $input) = @_;
+
+    my $tokens_ref = $super->($self, $input);
+    for(my $i = 0; $i < @{$tokens_ref}; $i++) {
+        my $token = $tokens_ref->[$i];
+        next if $token->[0] ne 'code';
+
+        # FIXME
+        next if $token->[1] =~ /\A [a-zA-Z]/xms;
+
+        splice @{$tokens_ref}, $i, 1,
+            $token, ['postchomp'];
+        $i++;
+    }
+    if(!($tokens_ref->[-1][0] eq 'text'
+            && $tokens_ref->[-1][1] =~ /\n \z/xms)) {
+        push @{$tokens_ref}, ['code', 'print_raw "\n";'];
+    }
+    return $tokens_ref;
+};
+
+our @_current_context;
+our $_loop_var_name;
+
+around parse => sub {
+    my($super, $self, @args) = @_;
+    local @_current_context;
+    local $_loop_var_name = '.';
+    return $super->($self, @args);
+};
 
 sub init_symbols {
     my($parser) = @_;
@@ -61,6 +78,10 @@ sub init_symbols {
     # partials
     $parser->symbol('>')->set_std(\&std_gt);
 
+    # pragmas
+    $parser->symbol('%')->set_std(\&std_percent);
+    $parser->symbol('=');
+
     return;
 }
 
@@ -71,10 +92,30 @@ sub default_nud {
 
 sub undefined_name {
     my($parser, $name) = @_;
-    return $parser->symbol('(variable)')->clone(
-        id => $name,
+    return $parser->nud_variable(
+        $parser->symbol('(variable)')->clone( id => $name ),
     );
 }
+
+# {{foo}}                                 ->  foo
+# {{#foo}}{{bar}}{{/foo}}                 -> .bar
+around nud_variable => sub {
+    my($super, $parser, $symbol) = @_;
+    my $node = $super->($parser, $symbol);
+    if(@_current_context
+            && $symbol->arity eq 'variable'
+            && $symbol->id ne $_current_context[-1]->id) {
+        warn $symbol->id;
+        my $cur = $_current_context[-1];
+        $node = $parser->symbol('(fetch)')->clone(
+            arity  => 'field',
+            first  => $cur,
+            second => $symbol->clone( arity => 'literal' ),
+        );
+    }
+
+    return $node;
+};
 
 sub as_list {
     my($parser, $name) = @_;
@@ -104,19 +145,27 @@ sub as_list {
     );
 }
 
+# sections:
 # {{#foo}} ... {{/foo}}
 # ->
 # for __make_list($foo) -> $_ { ... }
 sub std_pound {
     my($parser, $symbol) = @_;
-    my $name   = $parser->expression(0);
+    my $name = $parser->expression(0);
+
+    my $iter = $parser->symbol('(variable)')->clone(
+        arity => 'variable',
+        id    => $_loop_var_name,
+    );
+    push @_current_context, $iter;
     my $block  = $parser->statements();
+    pop @_current_context;
     $parser->advance('/');
     $parser->advance($name->id);
     return $symbol->clone(
         arity  => 'for',
         first  => $parser->as_list($name),
-        second => [$parser->symbol('.')],
+        second => [$iter], # loop variable
         third  => $block,
     );
 }
@@ -154,6 +203,27 @@ sub std_gt {
         first => $name,
     );
 }
+
+# pragmas: {{%PRAGMA-NAME attr=value}}
+sub std_percent {
+    my($parser, $symbol) = @_;
+    my $token = $parser->token();
+    if(!any_in($token->arity, qw(name variable))) {
+        $parser->_unexpect("a pragma name", $token);
+    }
+    my $name = $token->id;
+    $parser->advance(); # pragma name
+    if($name eq 'IMPLICIT-ITERATOR') {
+        $parser->advance('iterator');
+        $parser->advance('=');
+        $_loop_var_name = $parser->token->id;
+    }
+    else {
+        $parser->_error("Unknown pragma name '$name'");
+    }
+    return;
+}
+
 1;
 __END__
 
